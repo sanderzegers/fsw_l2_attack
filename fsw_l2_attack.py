@@ -46,7 +46,7 @@ def l2_flood(floodtype,iface=main_args.interface):
 
     if floodtype == "unknown_broadcast":
        print("Generating",main_args.packetcount,"broadcast flood packets")
-       base_mac_int = int.from_bytes(b'\x01\x00\x00\x00\x00\x00', 'big')
+       base_mac_int = int.from_bytes(b'\x08\x00\x00\x00\x00\x00', 'big')
        dstip = main_args.destinationip
        if main_args.destinationip=="0.0.0.0":
           dstip = "255.255.255.255"
@@ -60,7 +60,7 @@ def l2_flood(floodtype,iface=main_args.interface):
 
     for i in range(1, main_args.packetcount):
         src_mac = ':'.join('%02x' % byte for byte in (base_mac_int + i).to_bytes(6, 'big')) # Iterate over source mac address, add one each loop
-        frame = Ether(src=src_mac, dst=dst_mac) / IP(dst=dstip, src=RandIP(), ttl=ttl)
+        frame = Ether(src=src_mac, dst=dst_mac) / IP(dst=dstip, src=RandIP(), ttl=ttl) / ICMP()
         packet_list.append(frame)
 
     print("Sending packets...",end="")
