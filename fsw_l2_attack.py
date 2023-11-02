@@ -51,6 +51,7 @@ dhcpserver_parser.add_argument("-s","--scope",help="IP Range of provided IPs by 
 dhcpserver_parser.add_argument("-sn","--subnetmask",help="Subnetmask for the provided IPs",required=True)
 dhcpserver_parser.add_argument("-g","--gateway",help="Provided the Gateway IP. By default this host will be the gateway",required=True)
 dhcpserver_parser.add_argument("-d","--dns",help="Provided single IP address for DNS Server",default="8.8.8.8")
+dhcpserver_parser.add_argument("-c","--checkfree",help="Check if offered IP is free",default=False,type=bool)
 
 
 #vlanhop_parser.add_argument("-a","--activerecon",help="Send additional packets to detect VLANs. Noisy!")
@@ -103,8 +104,26 @@ def mac_to_bin(mac_address):
 
 def allocate_ip(mac):
    global dhcp_leases
-   dhcp_leases[mac]['ip'] = "192.168.1.100"
-   dhcp_leases[mac]['expiry'] = 5000
+
+   start_ip,end_ip = main_args.scope.split('-')
+
+   start_ip= ipaddress.IPv4Address(start_ip)
+   end_ip = ipaddress.IPv4Address(end_ip)
+
+   found_free_ip = False
+
+   while start_ip<=end_ip and not found_free_ip:
+      for entry in dhcp_leases.values():
+           if entry.get('ip') != start_ip:
+               if main_args.checkfree:
+                  print("implement check free")
+               else:
+                  print(start_ip,"is free")
+                  dhcp_leases[mac]['ip']=str(start_ip)
+                  dhcp_leases[mac]['expiry'] = 5000
+                  found_free_ip = True
+                  break
+      start_ip += 1
 
 
 def handle_dhcp_packet(packet,transaction_id):
@@ -117,6 +136,25 @@ def handle_dhcp_packet(packet,transaction_id):
         dhcp_leases[str(packet[Ether].src)] = {"transaction_id":packet[BOOTP].xid}
         allocate_ip(packet[Ether].src)
         send_dhcp_offer(packet[Ether].src)
+    if DHCP in packet and packet[DHCP].options[0][1] == 3:  # DHCP Discover
+        for entry in dhcp_leases.values():
+           if entry.get('transaction_id') == packet[BOOTP].xid:
+               send_dhcp_ack(packet[Ether].src)
+
+def send_dhcp_ack(mac):
+    global dhcp_leases
+    dhcp_lease = dhcp_leases[mac]
+    print("Answering DHCP Request")
+    dhcp_ack = (
+        Ether(dst=mac) /
+        IP(dst=dhcp_lease["ip"]) /
+        UDP(sport=67, dport=68) /
+        BOOTP(op=2,chaddr=mac_to_bin(mac),xid=dhcp_lease["transaction_id"],yiaddr=dhcp_lease["ip"]) /
+        DHCP(options=[("message-type", "ack"), ("lease_time",3600), ("subnet_mask","255.255.255.0"),("router",main_args.gateway),("name_server",main_args.dns), "end"])
+    )
+    sendp(dhcp_ack,verbose=False)
+
+
 
 
 def send_dhcp_offer(mac):
@@ -125,8 +163,8 @@ def send_dhcp_offer(mac):
     dprint(dhcp_lease,level=2)
     dhcp_offer = (
         Ether(dst=mac) /
-        IP(dst=dhcp_lease["ip"]) /
-        UDP(sport=68, dport=67) /
+        IP(dst=dhcp_lease['ip']) /
+        UDP(sport=67, dport=68) /
         BOOTP(op=2,chaddr=mac_to_bin(mac),xid=dhcp_lease["transaction_id"],yiaddr=dhcp_lease["ip"]) /
         DHCP(options=[("message-type", "offer"), ("lease_time",3600), ("subnet_mask","255.255.255.0"), "end"])
         )
@@ -134,6 +172,8 @@ def send_dhcp_offer(mac):
 
 
 def send_dhcp_discover(transaction_id):
+    global dhcp_leases
+    dhcp_lease = dhcp_leases[mac]
     dhcp_discover = (
         Ether(src=src_mac, dst="ff:ff:ff:ff:ff:ff") /
         IP(src="0.0.0.0", dst="255.255.255.255") /
