@@ -1,4 +1,4 @@
-# Layer 2 Attack Tool for FortiSwitch
+# FortiSwitch Layer 2 Attacks
 
 [![License](https://img.shields.io/badge/license-GPLv2-blue.svg)](LICENSE)
 
@@ -7,7 +7,8 @@ This tool is for educational purposes and lawful use only. Always ensure you hav
 
 ## Overview
 
-This repository contains a tool designed to execute various Layer 2 attacks on a FortiSwitch. While it's targeted at FortiSwitch devices, it may be effective on other switches as well.
+This repository contains a tool designed to execute various Layer 2 attacks on a FortiSwitch. Currently only the VLAN Hopping attack is FortiSwitch specific, all other attacks will work in other setups as well.
+
 
 ## Prerequisites
 
@@ -24,21 +25,6 @@ apt-get install tcpreplay
 
 ## Features
 
-### Flood
-
-Flood will prepare packets in memory, and send out all at maximum speed. Mainly created to test storm control.
-
-#### Attack
-
-```
-sudo ./fsw_l2_attack.py flood -t unknown_multicast -c 1000
-Launching flood attack: unknown_multicast
-Generating 1000 multicast flood packets
-Sending packets...Done
-```
-#### Prevention
-
-Set MAC address learning limit per port to prevent CAM table overflow. Enable storm control to limit impact on network and switch/firewall processes.
 
 
 ### VLAN Hopping
@@ -67,9 +53,66 @@ Detected VLANs (passivly):
 210
 ```
 
+#### Prevent
+
+Either disable LLDP completely on the switchports or change assigned LLDP Profile from 'default-auto-isl' to 'default'.
+
+
+
+### DHCP Exhaustion
+
+Request all available free IP addresses on the DHCP Server.
+
+```
+sudo ./fsw_l2_attack.py dhcpexhaustion
+Launching DHCP Server exhaustion attack
+Requesting 192.168.100.54 ...
+Requesting 192.168.100.55 ...
+Requesting 192.168.100.56 ...
+Requesting 192.168.100.57 ...
+```
+
+
+### DHCP Server
+
+#### Attack
+
+A very simplistics DHCP Server able to server IPs to clients according to the application arguments.
+
+```
+sudo ./fsw_l2_attack.py dhcpserver --scope 192.168.1.30-192.168.1.40 --subnetmask 255.255.255.0 --gateway 192.168.1.1 --dns 8.8.8.8
+Launching DHCP Server
+192.168.1.30-192.168.1.40
+Start IP: 192.168.1.30
+End IP: 192.168.1.40
+Listening for Discover packages
+192.168.1.30 is free
+Answering DHCP Request
+192.168.1.30 is free
+Answering DHCP Request
+```
+
 #### Prevention
 
-Either disable LLDP completely on the switchports, or change assigned LLDP Profile from 'default-auto-isl' to 'default'.
+Enable DHCP Snooping on the VLAN.
+
+
+
+### Flood
+
+Flood will prepare packets in memory, and send out all at maximum speed. Created to test storm control.
+
+#### Attack
+
+```
+sudo ./fsw_l2_attack.py flood -t unknown_multicast -c 1000
+Launching flood attack: unknown_multicast
+Generating 1000 multicast flood packets
+Sending packets...Done
+```
+#### Prevent
+
+Set MAC address learning limit per port to prevent CAM table overflow. Enable storm control to limit impact on network and switch/firewall processes.
 
 ## Disclaimer
 
